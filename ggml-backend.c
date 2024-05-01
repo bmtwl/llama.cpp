@@ -9,6 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "numa.h"
+#include "numaif.h"
+#include "sched.h"
+#include <unistd.h>
+#include <errno.h>
+//#include <sys/mman.h>
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -103,10 +109,79 @@ void * ggml_backend_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 GGML_CALL void ggml_backend_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
-    // init_tensor is optional
+    static int numanode=0;
+
     if (buffer->iface.init_tensor) {
         buffer->iface.init_tensor(buffer, tensor);
     }
+
+    // Get the number of pages
+    int num_pages = tensor->buffer->size / getpagesize();
+
+    if (strstr(tensor->name,".weight\0") == NULL) {
+//        printf("skip %s\n",tensor->name);
+        return;
+    }
+
+//    printf("moving %i %s\n",numanode, tensor->name);
+
+    int cpu = sched_getcpu();
+    int pidnode = numa_node_of_cpu(cpu);
+    int numa_nodecount = numa_max_node()+1;
+
+    int node = numanode % numa_nodecount;
+    numanode++;
+
+    if (node == pidnode) {
+//        printf("Skipping PID node\n");
+        return;
+    }
+
+    unsigned long nodemask = 0;
+    nodemask |= 1 << node;
+
+
+    // Create an array to store page addresses
+    void *pages[num_pages];
+    int dest_node[num_pages];
+    int page_status[num_pages];
+
+    // Get the addresses of pages associated with the buffer
+    for (int i = 0; i < num_pages; i++) {
+        pages[i] = (void *)((uintptr_t)tensor->data + (i * getpagesize()));
+        dest_node[i] = node;
+        page_status[i] = 999;
+    }
+    int notmoved = 0;
+    long ret =  move_pages(0, num_pages, pages, dest_node, page_status, MPOL_MF_MOVE_ALL );
+
+    if (ret == -1) {
+        perror("numa_move_pages");
+    }
+    else {
+        if (mbind((void *)((uintptr_t)tensor->data),num_pages * getpagesize(), MPOL_BIND | MPOL_F_STATIC_NODES , &nodemask, sizeof(nodemask)*numa_nodecount, MPOL_MF_MOVE_ALL) != 0) {
+            printf("mbind on node %i Failed %i!\n",node,errno);
+        }
+
+        ret = move_pages(0, num_pages, pages, NULL, page_status, MPOL_MF_MOVE_ALL);
+        if (ret != 0) {
+            printf("move_pages failed %ld %i\n", ret, errno);
+        }
+        else {
+//            printf("Good %ld\n", ret);
+        }
+//        printf("Success for %i pages on node %i\n",num_pages,node );
+        notmoved = 0;
+        for (int i=0; i<num_pages; i++) {
+            if (page_status[i] == 999) {
+                notmoved++;
+            }
+        }
+    }
+    if (mbind((void *)((uintptr_t)tensor->data),num_pages * getpagesize(), MPOL_BIND | MPOL_F_STATIC_NODES , &nodemask, sizeof(nodemask)*numa_nodecount, MPOL_MF_MOVE_ALL) != 0) {
+        printf("mbind on node %i Failed %i!\n",node,errno);
+    }
+
 }
 
 size_t ggml_backend_buffer_get_alignment (ggml_backend_buffer_t buffer) {
@@ -565,6 +640,10 @@ GGML_CALL static void ggml_backend_cpu_buffer_free_buffer(ggml_backend_buffer_t 
     free(buffer->context);
 }
 
+GGML_CALL static void ggml_backend_cpu_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor* tensor, const void* data, size_t offset, size_t size) {
+    GGML_UNUSED(buffer);
+}
+
 GGML_CALL static void ggml_backend_cpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     memcpy((char *)tensor->data + offset, data, size);
 
@@ -595,7 +674,7 @@ static struct ggml_backend_buffer_i cpu_backend_buffer_i = {
     /* .get_name        = */ ggml_backend_cpu_buffer_name,
     /* .free_buffer     = */ ggml_backend_cpu_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_cpu_buffer_get_base,
-    /* .init_tensor     = */ NULL, // no initialization required
+    /* .init_tensor     = */ ggml_backend_cpu_buffer_init_tensor,
     /* .set_tensor      = */ ggml_backend_cpu_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_cpu_buffer_get_tensor,
     /* .cpy_tensor      = */ ggml_backend_cpu_buffer_cpy_tensor,
