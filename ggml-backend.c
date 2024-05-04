@@ -109,36 +109,31 @@ void * ggml_backend_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 GGML_CALL void ggml_backend_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
-    static int numanode=0;
-
     if (buffer->iface.init_tensor) {
         buffer->iface.init_tensor(buffer, tensor);
     }
 
     // Get the number of pages
-    int num_pages = tensor->buffer->size / getpagesize();
-
-    if (strstr(tensor->name,".weight\0") == NULL) {
-//        printf("skip %s\n",tensor->name);
-        return;
-    }
-
-//    printf("moving %i %s\n",numanode, tensor->name);
-
-    int cpu = sched_getcpu();
-    int pidnode = numa_node_of_cpu(cpu);
+    int pagesize = getpagesize();
+    int num_pages = tensor->buffer->size / pagesize;
     int numa_nodecount = numa_max_node()+1;
 
-    int node = numanode % numa_nodecount;
-    numanode++;
 
-    if (node == pidnode) {
-//        printf("Skipping PID node\n");
+    if (strstr(tensor->name,".weight\0") == NULL || strstr(tensor->name,".attn_\0") != NULL || num_pages < 256 ) {
+//        printf("skip %s (%i page)\n",tensor->name, num_pages);
         return;
     }
 
-    unsigned long nodemask = 0;
-    nodemask |= 1 << node;
+//    printf("moving %s (%i pages)\n", tensor->name, num_pages);
+
+//    size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+//    printf("numa nodes %i, pagesize %i, rowsize %zu (%ld)\n", numa_nodecount, pagesize, row_size, tensor->ne[0]);
+
+    unsigned long nodemask[numa_nodecount];
+
+    for (int i=0; i < numa_nodecount-1; i++) {
+       nodemask[i] = 1 << i;
+    }
 
 
     // Create an array to store page addresses
@@ -146,42 +141,101 @@ GGML_CALL void ggml_backend_buffer_init_tensor(ggml_backend_buffer_t buffer, str
     int dest_node[num_pages];
     int page_status[num_pages];
 
+    int pages_per_numa_node = num_pages / numa_nodecount;
+//    printf("ppn %i\n",pages_per_numa_node);
+    int node = 0;
+
     // Get the addresses of pages associated with the buffer
     for (int i = 0; i < num_pages; i++) {
-        pages[i] = (void *)((uintptr_t)tensor->data + (i * getpagesize()));
+        pages[i] = (void *)((uintptr_t)tensor->data + (i * pagesize));
+        node = i/pages_per_numa_node;
         dest_node[i] = node;
+//        printf("%i",node);
         page_status[i] = 999;
     }
-    int notmoved = 0;
-    long ret =  move_pages(0, num_pages, pages, dest_node, page_status, MPOL_MF_MOVE_ALL );
+    long ret =  0; //move_pages(0, num_pages, pages, dest_node, page_status, MPOL_MF_MOVE_ALL );
 
     if (ret == -1) {
         perror("numa_move_pages");
     }
     else {
-        if (mbind((void *)((uintptr_t)tensor->data),num_pages * getpagesize(), MPOL_BIND | MPOL_F_STATIC_NODES , &nodemask, sizeof(nodemask)*numa_nodecount, MPOL_MF_MOVE_ALL) != 0) {
-            printf("mbind on node %i Failed %i!\n",node,errno);
+        if (ret > 0) {
+            printf("moved %ld of %i pages\n",ret-num_pages,num_pages);
+            int notmoved = 0;
+            int oldstatus = 0;
+            for (int i=0; i<num_pages; i++) {
+                if (page_status[i] == 999) {
+                    notmoved++;
+                }
+                else {
+                    if (page_status[i] != oldstatus) {
+                        printf("move failed %i\n",page_status[i]);
+                        oldstatus = page_status[i];
+                    }     
+                }
+            }
+            if (notmoved > 0) {
+                printf("Not moved pages: %i\n",notmoved);
+            }
+        }
+        else {
+//            printf("Successfully moved all %i pages\n",num_pages);
+        }
+        void * membufchunk = tensor->data;
+        if ((unsigned long)membufchunk % pagesize != 0) {
+//            printf("alignment error! %ld", (unsigned long)tensor->data);
+            membufchunk = ((unsigned long)tensor->data  & ~(pagesize-1)); // + pagesize;
+//            printf(" now %ld\n", (unsigned long)membufchunk);
         }
 
-        ret = move_pages(0, num_pages, pages, NULL, page_status, MPOL_MF_MOVE_ALL);
+        for (int i=0; i<numa_nodecount-1; i++) {
+            membufchunk += ((num_pages/numa_nodecount) * i) * pagesize;
+//            unsigned long chunksize = tensor->buffer->size / numa_nodecount;
+//            if(membufchunk + chunksize > tensor->buffer + tensor->buffer->size) {
+//                chunksize = (((unsigned long)tensor->buffer + (unsigned long)tensor->buffer->size) - (unsigned long)membufchunk & ~(pagesize-1));
+//                printf("Trimming last page\n");
+//            }
+//            if(membufchunk+ chunksize < tensor->data + tensor->buffer->size) { 
+                ret = mbind(membufchunk, tensor->buffer->size / numa_nodecount, MPOL_BIND | MPOL_F_STATIC_NODES , &nodemask[i], sizeof(nodemask[i])*numa_nodecount, MPOL_MF_MOVE_ALL); 
+//            } else { 
+//                printf("disaster averted\n"); 
+//            }
+            if (ret != 0) {
+                perror("mbind");
+                printf("mbind on %s address %ld (max address %ld) to node %i failed wth errno %i!\n",tensor->name, membufchunk, tensor->data + tensor->buffer->size, i,errno);
+            }
+            else {
+//                printf("mbind on node %i succeeded with nodemask %ld (%ld)\n",i,nodemask[i], ret);
+            }
+        }
+
+        ret = move_pages(0, num_pages, pages, NULL, page_status, 0);
         if (ret != 0) {
-            printf("move_pages failed %ld %i\n", ret, errno);
+            printf("verifying move_pages failed %ld %i\n", ret, errno);
         }
         else {
 //            printf("Good %ld\n", ret);
         }
 //        printf("Success for %i pages on node %i\n",num_pages,node );
-        notmoved = 0;
+/*        int notmoved = 0;
+        int oldstatus = 0;
         for (int i=0; i<num_pages; i++) {
             if (page_status[i] == 999) {
                 notmoved++;
             }
+            else {
+                if (page_status[i] != oldstatus) {
+                    printf("Page number %i failed (%i)\n",i,page_status[i]);
+                    oldstatus = page_status[i];
+                } else {
+//                    printf("Page number %i succeeded (%i)\n",i,page_status[i]);
+                }
+            }
         }
+        if (notmoved > 0) {
+            printf("Not moved pages: %i\n",notmoved);
+        } */
     }
-    if (mbind((void *)((uintptr_t)tensor->data),num_pages * getpagesize(), MPOL_BIND | MPOL_F_STATIC_NODES , &nodemask, sizeof(nodemask)*numa_nodecount, MPOL_MF_MOVE_ALL) != 0) {
-        printf("mbind on node %i Failed %i!\n",node,errno);
-    }
-
 }
 
 size_t ggml_backend_buffer_get_alignment (ggml_backend_buffer_t buffer) {
