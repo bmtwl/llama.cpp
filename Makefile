@@ -649,7 +649,7 @@ override CFLAGS    := $(CPPFLAGS) $(MK_CFLAGS) $(GF_CFLAGS) $(CFLAGS)
 BASE_CXXFLAGS      := $(MK_CXXFLAGS) $(CXXFLAGS)
 override CXXFLAGS  := $(BASE_CXXFLAGS) $(HOST_CXXFLAGS) $(GF_CXXFLAGS) $(CPPFLAGS)
 override NVCCFLAGS := $(MK_NVCCFLAGS) $(NVCCFLAGS)
-override LDFLAGS   := $(MK_LDFLAGS) $(LDFLAGS) -lnuma
+override LDFLAGS   := $(MK_LDFLAGS) $(LDFLAGS) -lnuma -lcap
 
 # identify CUDA host compiler
 ifdef LLAMA_CUDA
