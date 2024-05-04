@@ -27,6 +27,9 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <numa.h>
+#include <numaif.h>
+#include <sys/capability.h>
 #endif
 
 #ifdef GGML_USE_METAL
@@ -2342,6 +2345,26 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
 
         return;
+    }
+
+    int nodecount = numa_max_node();
+
+    cap_t caps;
+    cap_flag_value_t effective;
+    
+    // Get the capabilities of the current process. Use 0 or -1 as procid to refer to this process.
+    caps = cap_get_proc();
+
+    if (cap_get_flag(caps, CAP_SYS_NICE, CAP_EFFECTIVE, &effective) != 0) { printf("CAP_SYS_NICE capability missing!\n"); } else { printf("Capability CAP_SYS_NICE available\n"); }
+    cap_free(&caps); // Always free the resource when done.
+
+    printf("Changing memory policy\n");
+    numa_set_strict(1);
+    numa_set_localalloc();
+    unsigned long nodemask = 1L << 1;
+    long polret = set_mempolicy(MPOL_BIND | MPOL_F_STATIC_NODES, &nodemask, 1*nodecount);
+    if (polret !=0) {
+        perror("set_mempolicy");
     }
 
 #if defined(__gnu_linux__)
